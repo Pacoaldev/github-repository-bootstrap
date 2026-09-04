@@ -4,7 +4,7 @@
   "title": "GitHub Project Bootstrap configuration",
   "type": "object",
   "additionalProperties": false,
-  "required": ["account", "repository", "labels", "milestones", "templates", "project"],
+  "required": ["account", "repository"],
   "properties": {
     "account": { "type": "string", "pattern": "^[A-Za-z0-9-]+$", "maxLength": 39 },
     "repository": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "maxLength": 200 },
@@ -13,14 +13,28 @@
       "items": { "type": "string", "minLength": 1, "maxLength": 100 },
       "uniqueItems": true,
       "maxItems": 10,
-      "default": ["repo", "project"]
+      "default": ["repo"]
     },
     "labels": { "$ref": "#/$defs/labels" },
     "milestones": { "$ref": "#/$defs/milestones" },
     "templates": { "$ref": "#/$defs/templates" },
-    "project": { "$ref": "#/$defs/project" }
-  },
-  "$defs": {
+      "project": { "$ref": "#/$defs/project" }
+    },
+    "allOf": [
+      {
+        "if": { "not": { "required": ["project"] } },
+        "then": {
+          "properties": {
+            "requiredScopes": {
+              "not": {
+                "contains": { "enum": ["project", "read:project"] }
+              }
+            }
+          }
+        }
+      }
+    ],
+    "$defs": {
     "mode": { "type": "string", "enum": ["ensure", "replace"], "default": "ensure" },
     "labelName": { "type": "string", "minLength": 1, "maxLength": 50 },
     "milestoneTitle": { "type": "string", "minLength": 1, "maxLength": 255 },

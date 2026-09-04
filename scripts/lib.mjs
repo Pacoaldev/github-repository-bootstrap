@@ -112,14 +112,7 @@ export function validationErrors(config) {
     "templates",
     "project",
   ]);
-  for (const key of [
-    "account",
-    "repository",
-    "labels",
-    "milestones",
-    "templates",
-    "project",
-  ]) {
+  for (const key of ["account", "repository"]) {
     if (!(key in config)) add(`$.${key}`, "is required");
   }
   if (
@@ -158,9 +151,20 @@ export function validationErrors(config) {
           );
       });
     }
+    if (
+      !config.project &&
+      Array.isArray(config.requiredScopes) &&
+      config.requiredScopes.some((scope) =>
+        ["project", "read:project"].includes(scope),
+      )
+    )
+      add("$.requiredScopes", "project scope requires a configured project");
   }
 
-  if (resourceMap(config.labels, "$.labels", LIMITS.labels)) {
+  if (
+    config.labels !== undefined &&
+    resourceMap(config.labels, "$.labels", LIMITS.labels)
+  ) {
     for (const [name, label] of Object.entries(config.labels)) {
       mapKey(name, "$.labels", LIMITS.labelNameLength, "label name");
       if (!object(label, `$.labels.${name}`)) continue;
@@ -186,7 +190,10 @@ export function validationErrors(config) {
     }
   }
 
-  if (resourceMap(config.milestones, "$.milestones", LIMITS.milestones)) {
+  if (
+    config.milestones !== undefined &&
+    resourceMap(config.milestones, "$.milestones", LIMITS.milestones)
+  ) {
     for (const [title, milestone] of Object.entries(config.milestones)) {
       mapKey(
         title,
@@ -218,7 +225,10 @@ export function validationErrors(config) {
     }
   }
 
-  if (object(config.templates, "$.templates")) {
+  if (
+    config.templates !== undefined &&
+    object(config.templates, "$.templates")
+  ) {
     known(config.templates, "$.templates", [
       "issueForms",
       "issueFormLabels",
@@ -294,7 +304,7 @@ export function validationErrors(config) {
       add("$.templates.mode", "must be ensure or replace");
   }
 
-  if (object(config.project, "$.project")) {
+  if (config.project !== undefined && object(config.project, "$.project")) {
     known(config.project, "$.project", ["title", "fields", "views"]);
     if (
       !hasLength(config.project.title, LIMITS.projectTitleLength) ||
@@ -409,23 +419,25 @@ function normalizeResourceMap(
 export function normalizeConfig(config) {
   return {
     ...config,
-    requiredScopes: config.requiredScopes ?? ["repo", "project"],
-    labels: normalizeResourceMap(config.labels, "name", (label) => ({
+    requiredScopes: config.requiredScopes ?? (config.project ? ["repo", "project"] : ["repo"]),
+    labels: normalizeResourceMap(config.labels ?? {}, "name", (label) => ({
       ...label,
       color: label.color.toUpperCase(),
       managed: label.managed === true,
     })),
     milestones: normalizeResourceMap(
-      config.milestones,
+      config.milestones ?? {},
       "title",
       (milestone) => ({ ...milestone, managed: milestone.managed === true }),
     ),
-    templates: { ...config.templates },
-    project: {
-      ...config.project,
-      fields: normalizeResourceMap(config.project.fields, "name"),
-      views: normalizeResourceMap(config.project.views, "name"),
-    },
+    templates: config.templates ? { ...config.templates } : null,
+    project: config.project
+      ? {
+          ...config.project,
+          fields: normalizeResourceMap(config.project.fields, "name"),
+          views: normalizeResourceMap(config.project.views, "name"),
+        }
+      : null,
   };
 }
 
@@ -682,13 +694,11 @@ function action(resource, target, actionName, reason, details = {}) {
 }
 
 function sortedByIdentity(resources, identity) {
-  return [...resources].sort((left, right) =>
-    left[identity] < right[identity]
-      ? -1
-      : left[identity] > right[identity]
-        ? 1
-        : 0,
-  );
+  return [...resources].sort((left, right) => {
+    if (left[identity] < right[identity]) return -1;
+    if (left[identity] > right[identity]) return 1;
+    return 0;
+  });
 }
 
 export function buildPlan(config, observed = {}) {
@@ -747,23 +757,25 @@ export function buildPlan(config, observed = {}) {
         ),
       );
   }
-  const desiredTemplates = [
-    ".github/ISSUE_TEMPLATE/config.yml",
-    ...config.templates.issueForms.map((name) =>
-      path.posix.join(".github/ISSUE_TEMPLATE", `${name}.yml`),
-    ),
-    ...(config.templates.pullRequest
-      ? [".github/pull_request_template.md"]
-      : []),
-  ];
+  const desiredTemplates = [];
+  if (config.templates) {
+    desiredTemplates.push(
+      ".github/ISSUE_TEMPLATE/config.yml",
+      ...config.templates.issueForms.map((name) =>
+        path.posix.join(".github/ISSUE_TEMPLATE", `${name}.yml`),
+      ),
+    );
+    if (config.templates.pullRequest)
+      desiredTemplates.push(".github/pull_request_template.md");
+  }
   const presentTemplates = new Set(observed.templates ?? []);
   for (const file of desiredTemplates) {
     const exists = presentTemplates.has(file);
-    const templateAction = exists
-      ? config.templates.mode === "replace"
-        ? "update"
-        : "skip"
-      : "create";
+    let templateAction = "create";
+    if (exists) {
+      if (config.templates.mode === "replace") templateAction = "update";
+      else templateAction = "skip";
+    }
     plan.push(
       action(
         "template",
@@ -773,6 +785,7 @@ export function buildPlan(config, observed = {}) {
       ),
     );
   }
+  if (!config.project) return plan;
   const project = observed.project;
   if (project)
     plan.push(

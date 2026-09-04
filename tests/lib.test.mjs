@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -59,6 +60,93 @@ function errorsFor(config) {
 function messagesFor(config) {
   return validationErrors(config).map((error) => error.message);
 }
+
+test("minimal config disables omitted resource families without project API work", () => {
+  const minimal = { account: "acme", repository: "acme/widgets" };
+  assert.deepEqual(validationErrors(minimal), []);
+  for (const scope of ["project", "read:project"]) {
+    assert.equal(
+      errorsFor({ ...minimal, requiredScopes: ["repo", scope] }).includes(
+        "$.requiredScopes",
+      ),
+      true,
+    );
+  }
+  const schema = JSON.parse(
+    fs.readFileSync(
+      path.join(skillRoot, "assets", "config.schema.json"),
+      "utf8",
+    ),
+  );
+  assert.deepEqual(schema.required, ["account", "repository"]);
+  assert.deepEqual(
+    schema.allOf[0].then.properties.requiredScopes.not.contains.enum,
+    ["project", "read:project"],
+  );
+  const normalized = normalizeConfig(minimal);
+  assert.deepEqual(normalized.labels, []);
+  assert.deepEqual(normalized.milestones, []);
+  assert.equal(normalized.templates, null);
+  assert.equal(normalized.project, null);
+  assert.deepEqual(buildPlan(normalized), []);
+
+  const temporaryDirectory = fs.mkdtempSync(
+    path.join(skillRoot, "tests", ".minimal-config-"),
+  );
+  try {
+    const repository = path.join(temporaryDirectory, "repository");
+    const bin = path.join(temporaryDirectory, "bin");
+    const configPath = path.join(temporaryDirectory, "config.json");
+    const logPath = path.join(temporaryDirectory, "gh.log");
+    fs.mkdirSync(bin);
+    execFileSync("git", ["init", repository], { stdio: "ignore" });
+    execFileSync("git", ["-C", repository, "remote", "add", "origin", "https://github.com/acme/widgets.git"]);
+    fs.writeFileSync(configPath, JSON.stringify(minimal));
+    fs.writeFileSync(
+      path.join(bin, "gh"),
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.GH_LOG, JSON.stringify(args) + "\\n");
+if (args[0] === "--version") process.stdout.write("gh version test\\n");
+else if (args.join(" ") === "api -i user") process.stdout.write("HTTP/2 200\\nx-oauth-scopes: repo\\n");
+else if (args.join(" ") === "api users/acme") process.stdout.write('{"type":"Organization"}');
+else if (args.join(" ") === "api repos/acme/widgets") process.stdout.write('{"full_name":"acme/widgets","node_id":"R_1","owner":{"login":"acme"}}');
+else if (args.join(" ") === "api user") process.stdout.write('{"login":"maintainer"}');
+else process.exitCode = 1;
+`,
+      { mode: 0o755 },
+    );
+    const run = (mode, authorize) =>
+      spawnSync(
+        process.execPath,
+        [
+          path.join(skillRoot, "scripts", "bootstrap.mjs"),
+          "--config",
+          configPath,
+          "--repo-dir",
+          repository,
+          "--mode",
+          mode,
+          ...(authorize ? ["--authorize", authorize] : []),
+        ],
+        {
+          encoding: "utf8",
+          env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, GH_LOG: logPath },
+        },
+      );
+    const planResult = run("plan");
+    assert.equal(planResult.status, 0, planResult.stderr);
+    const planReport = JSON.parse(planResult.stdout);
+    const applyResult = run("apply", planReport.authorization.value);
+    assert.equal(applyResult.status, 0, applyResult.stderr);
+    assert.equal(JSON.parse(applyResult.stdout).success, true);
+    const calls = fs.readFileSync(logPath, "utf8");
+    assert.doesNotMatch(calls, /project|graphql|labels|milestones/i);
+  } finally {
+    fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+});
 
 test("validation rejects unsafe or incomplete project fields", () => {
   const invalid = structuredClone(configuration);
@@ -528,18 +616,15 @@ test("templates enforce review labels, required scoped evidence, and no blank is
       "utf8",
     ),
   );
-  assert.equal(Object.hasOwn(example.labels, "status:needs-review"), true);
-  assert.equal(example.labels["status:needs-review"].managed, true);
+  assert.equal(Object.hasOwn(example, "project"), false);
+  assert.deepEqual(example.requiredScopes, ["repo"]);
+  assert.equal(example.labels["kind:bug"].managed, true);
   assert.equal(
-    example.templates.issueFormLabels.bug_report.includes(
-      "status:needs-review",
-    ),
+    example.templates.issueFormLabels.bug_report.includes("kind:bug"),
     true,
   );
   assert.equal(
-    example.templates.issueFormLabels.feature_request.includes(
-      "status:needs-review",
-    ),
+    example.templates.issueFormLabels.feature_request.includes("kind:feature"),
     true,
   );
 });

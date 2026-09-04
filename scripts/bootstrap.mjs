@@ -132,14 +132,16 @@ function validateLocalTarget(config, repoDir) {
       );
     }
     fs.accessSync(repoDir, fs.constants.W_OK);
-    for (const name of config.templates.issueForms)
-      fs.accessSync(sourceTemplate(`${name}.yml`), fs.constants.R_OK);
-    fs.accessSync(sourceTemplate("config.yml"), fs.constants.R_OK);
-    if (config.templates.pullRequest)
-      fs.accessSync(
-        sourceTemplate("pull_request_template.md"),
-        fs.constants.R_OK,
-      );
+        if (config.templates) {
+          for (const name of config.templates.issueForms)
+            fs.accessSync(sourceTemplate(`${name}.yml`), fs.constants.R_OK);
+          fs.accessSync(sourceTemplate("config.yml"), fs.constants.R_OK);
+          if (config.templates.pullRequest)
+            fs.accessSync(
+              sourceTemplate("pull_request_template.md"),
+              fs.constants.R_OK,
+            );
+        }
     return {
       repoDir,
       origin,
@@ -152,6 +154,7 @@ function validateLocalTarget(config, repoDir) {
 }
 
 function configuredTemplateDestinations(config) {
+  if (!config.templates) return [];
   return [
     ".github/ISSUE_TEMPLATE/config.yml",
     ...config.templates.issueForms.map((name) =>
@@ -324,25 +327,47 @@ function discover(config, repoDir) {
       `Repository ${config.repository} is not owned by configured account ${config.account}`,
     );
 
-  const labels = ghJson([
-    "api",
-    "--paginate",
-    "--slurp",
-    `repos/${config.repository}/labels?per_page=100`,
-  ]).flat();
-  const milestones = ghJson([
-    "api",
-    "--paginate",
-    "--slurp",
-    `repos/${config.repository}/milestones?state=all&per_page=100`,
-  ])
-    .flat()
-    .map((milestone) => ({
-      title: milestone.title,
-      description: milestone.description ?? null,
-      dueOn: milestone.due_on ?? null,
-      number: milestone.number,
-    }));
+  const labels = config.labels.length
+    ? ghJson([
+        "api",
+        "--paginate",
+        "--slurp",
+        `repos/${config.repository}/labels?per_page=100`,
+      ]).flat()
+    : [];
+  const milestones = config.milestones.length
+    ? ghJson([
+        "api",
+        "--paginate",
+        "--slurp",
+        `repos/${config.repository}/milestones?state=all&per_page=100`,
+      ])
+        .flat()
+        .map((milestone) => ({
+          title: milestone.title,
+          description: milestone.description ?? null,
+          dueOn: milestone.due_on ?? null,
+          number: milestone.number,
+        }))
+    : [];
+  if (!config.project)
+    return {
+      labels,
+      milestones,
+      templates: localTemplatePaths(config, repoDir),
+      project: null,
+      fields: [],
+      views: [],
+      viewsSupported: undefined,
+      repositoryId: repository.node_id,
+      validation: {
+        authenticatedAccount: ghJson(["api", "user"]).login,
+        configuredAccountType: account.type,
+        repository: repository.full_name,
+        repositoryId: repository.node_id,
+        grantedScopes: scopes,
+      },
+    };
   const candidate = resolveProjectByTitle(
     listProjects(config.account),
     config.project.title,
@@ -395,6 +420,7 @@ function discover(config, repoDir) {
 }
 
 function installTemplates(config, repoDir, report) {
+  if (!config.templates) return;
   const templateFiles = [
     {
       source: sourceTemplate("config.yml"),
@@ -770,6 +796,11 @@ function main() {
       );
       applyMilestones(config, observed, report);
       installTemplates(config, repoDir, report);
+      if (!config.project) {
+        report.success = true;
+        printReport(report);
+        return;
+      }
       const project = ensureProject(config, observed, report);
       const linked = linkProject(config, observed, project, report);
       const refreshed = discover(config, repoDir);
