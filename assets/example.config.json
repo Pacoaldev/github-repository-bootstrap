@@ -1,0 +1,33 @@
+{
+  "account": "egdev6",
+  "repository": "egdev6/particle-studio",
+  "requiredScopes": ["repo", "project"],
+  "labels": {
+    "type:feature": { "color": "1D76DB", "description": "New capability", "managed": true },
+    "type:bug": { "color": "D73A4A", "description": "Defect", "managed": true },
+    "status:needs-review": { "color": "FBCA04", "description": "Awaiting review", "managed": true }
+  },
+  "milestones": {
+    "Foundation": { "description": "Initial planning and delivery slice" }
+  },
+  "templates": {
+    "issueForms": ["bug_report", "feature_request"],
+    "issueFormLabels": {
+      "bug_report": ["type:bug", "status:needs-review"],
+      "feature_request": ["type:feature", "status:needs-review"]
+    },
+    "pullRequest": true,
+    "mode": "ensure"
+  },
+  "project": {
+    "title": "Particle Studio",
+    "fields": {
+      "Priority": { "dataType": "SINGLE_SELECT", "options": ["High", "Medium", "Low"] },
+      "Target date": { "dataType": "DATE" }
+    },
+    "views": {
+      "Board": { "layout": "BOARD" },
+      "Table": { "layout": "TABLE" }
+    }
+  }
+}

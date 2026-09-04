@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/github-project-bootstrap/config.schema.json",
+  "title": "GitHub Project Bootstrap configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["account", "repository", "labels", "milestones", "templates", "project"],
+  "properties": {
+    "account": { "type": "string", "pattern": "^[A-Za-z0-9-]+$", "maxLength": 39 },
+    "repository": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "maxLength": 200 },
+    "requiredScopes": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 100 },
+      "uniqueItems": true,
+      "maxItems": 10,
+      "default": ["repo", "project"]
+    },
+    "labels": { "$ref": "#/$defs/labels" },
+    "milestones": { "$ref": "#/$defs/milestones" },
+    "templates": { "$ref": "#/$defs/templates" },
+    "project": { "$ref": "#/$defs/project" }
+  },
+  "$defs": {
+    "mode": { "type": "string", "enum": ["ensure", "replace"], "default": "ensure" },
+    "labelName": { "type": "string", "minLength": 1, "maxLength": 50 },
+    "milestoneTitle": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "fieldName": { "type": "string", "minLength": 1, "maxLength": 100 },
+    "viewName": { "type": "string", "minLength": 1, "maxLength": 100 },
+    "labels": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/labelName" },
+      "additionalProperties": { "$ref": "#/$defs/label" },
+      "maxProperties": 50
+    },
+    "label": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["color"],
+      "properties": {
+        "color": { "type": "string", "pattern": "^[0-9A-Fa-f]{6}$" },
+        "description": { "type": "string", "maxLength": 100 },
+        "managed": { "type": "boolean", "default": false }
+      }
+    },
+    "milestones": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/milestoneTitle" },
+      "additionalProperties": { "$ref": "#/$defs/milestone" },
+      "maxProperties": 50
+    },
+    "milestone": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "description": { "type": "string", "maxLength": 1000 },
+        "dueOn": { "type": "string", "format": "date-time" },
+        "managed": { "type": "boolean", "default": false }
+      }
+    },
+    "templates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["issueForms", "issueFormLabels", "pullRequest", "mode"],
+      "properties": {
+        "issueForms": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["bug_report", "feature_request"] },
+          "uniqueItems": true,
+          "maxItems": 2
+        },
+        "issueFormLabels": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "bug_report": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 50 }, "uniqueItems": true, "maxItems": 10 },
+            "feature_request": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 50 }, "uniqueItems": true, "maxItems": 10 }
+          }
+        },
+        "pullRequest": { "type": "boolean" },
+        "mode": { "$ref": "#/$defs/mode" }
+      }
+    },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "fields", "views"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "fields": { "$ref": "#/$defs/fields" },
+        "views": { "$ref": "#/$defs/views" }
+      }
+    },
+    "fields": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/fieldName" },
+      "additionalProperties": { "$ref": "#/$defs/field" },
+      "maxProperties": 20
+    },
+    "field": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dataType"],
+      "properties": {
+        "dataType": { "type": "string", "enum": ["TEXT", "NUMBER", "DATE", "SINGLE_SELECT"] },
+        "options": { "type": "array", "items": { "type": "string", "pattern": "^[^,]+$", "minLength": 1, "maxLength": 100 }, "uniqueItems": true, "minItems": 1, "maxItems": 50 }
+      },
+      "allOf": [
+        { "if": { "required": ["dataType"], "properties": { "dataType": { "const": "SINGLE_SELECT" } } }, "then": { "required": ["options"] }, "else": { "not": { "required": ["options"] } } }
+      ]
+    },
+    "views": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/viewName" },
+      "additionalProperties": { "$ref": "#/$defs/view" },
+      "maxProperties": 20
+    },
+        "view": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["layout"],
+          "properties": {
+            "layout": { "type": "string", "enum": ["BOARD", "TABLE"] },
+            "settings": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "visibleFieldIds": {
+                  "type": "array",
+                  "items": { "type": "string", "minLength": 1, "maxLength": 255 },
+                  "uniqueItems": true,
+                  "maxItems": 20
+                }
+              }
+            }
+          }
+        }
+  }
+}
