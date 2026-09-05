@@ -17,6 +17,7 @@
     },
     "labels": { "$ref": "#/$defs/labels" },
     "milestones": { "$ref": "#/$defs/milestones" },
+    "files": { "$ref": "#/$defs/files" },
     "templates": { "$ref": "#/$defs/templates" },
       "project": { "$ref": "#/$defs/project" }
     },
@@ -69,6 +70,27 @@
         "description": { "type": "string", "maxLength": 1000 },
         "dueOn": { "type": "string", "format": "date-time" },
         "managed": { "type": "boolean", "default": false }
+      }
+    },
+    "repositoryPath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?![\\\\/])(?![A-Za-z]:)(?!(?:.*[\\\\/])?\\.{1,2}(?:[\\\\/]|$)).+$"
+    },
+    "files": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/repositoryPath" },
+      "additionalProperties": { "$ref": "#/$defs/file" },
+      "maxProperties": 100
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "mode"],
+      "properties": {
+        "source": { "$ref": "#/$defs/repositoryPath" },
+        "mode": { "$ref": "#/$defs/mode" }
       }
     },
     "templates": {

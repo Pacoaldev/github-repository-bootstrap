@@ -6,18 +6,22 @@ import { fileURLToPath } from "node:url";
 import {
   authorizationValue,
   buildPlan,
+  canonicalJson,
   createProjectV2ViewArgs,
   emptyReport,
   normalizeConfig,
   normalizeGitHubOrigin,
+  managedFileStates,
   parseOAuthScopes,
   projectFieldMatches,
   projectIdentity,
   repositoryBindingMatches,
   resolveProjectByTitle,
   resolveProjectViewByName,
+  preflightManagedFiles,
   templateDestination,
   validationErrors,
+  writeManagedFile,
   writeTemplateFile,
 } from "./lib.mjs";
 
@@ -131,8 +135,12 @@ function validateLocalTarget(config, repoDir) {
         `origin ${JSON.stringify(origin)} does not resolve to configured repository ${config.repository}`,
       );
     }
-    fs.accessSync(repoDir, fs.constants.W_OK);
-        if (config.templates) {
+    const repositoryRoot = fs.realpathSync(
+      run("git", ["-C", repoDir, "rev-parse", "--show-toplevel"]).trim(),
+    );
+    fs.accessSync(repositoryRoot, fs.constants.W_OK);
+    managedFileStates(config, repositoryRoot);
+    if (config.templates) {
           for (const name of config.templates.issueForms)
             fs.accessSync(sourceTemplate(`${name}.yml`), fs.constants.R_OK);
           fs.accessSync(sourceTemplate("config.yml"), fs.constants.R_OK);
@@ -143,7 +151,7 @@ function validateLocalTarget(config, repoDir) {
             );
         }
     return {
-      repoDir,
+      repoDir: repositoryRoot,
       origin,
       normalizedOrigin: normalizeGitHubOrigin(origin),
       repository: config.repository,
@@ -355,6 +363,7 @@ function discover(config, repoDir) {
       labels,
       milestones,
       templates: localTemplatePaths(config, repoDir),
+      files: managedFileStates(config, repoDir),
       project: null,
       fields: [],
       views: [],
@@ -404,6 +413,7 @@ function discover(config, repoDir) {
     labels,
     milestones,
     templates: localTemplatePaths(config, repoDir),
+    files: managedFileStates(config, repoDir),
     project,
     fields,
     views,
@@ -465,6 +475,44 @@ function installTemplates(config, repoDir, report) {
       resource: "template",
       target: relativeTarget,
       action: exists ? "update" : "create",
+    });
+  }
+}
+
+function installManagedFiles(config, repoDir, expected, report) {
+  const files = preflightManagedFiles(config, repoDir);
+  const observed = files.map((file) => ({
+    destination: file.destination,
+    source: file.source,
+    mode: file.mode,
+    sourceHash: file.sourceHash,
+    destinationHash: file.destinationHash,
+  }));
+  if (canonicalJson(observed) !== canonicalJson(expected))
+    throw new Error("Managed file source or destination changed after authorization");
+  for (const file of files) {
+    const missing = file.destinationHash === null;
+    if (!missing && file.mode === "ensure") {
+      report.skipped.push({
+        resource: "file",
+        target: file.destination,
+        reason: "existing file is unmanaged in ensure mode",
+      });
+      continue;
+    }
+    if (!missing && file.destinationHash === file.sourceHash) {
+      report.skipped.push({
+        resource: "file",
+        target: file.destination,
+        reason: "already matches source",
+      });
+      continue;
+    }
+    writeManagedFile(file);
+    report.completed.push({
+      resource: "file",
+      target: file.destination,
+      action: missing ? "create" : "update",
     });
   }
 }
@@ -749,6 +797,8 @@ function updateReport(report, args, observed, plan, authorization) {
   report.discovered = {
     labels: observed.labels.length,
     milestones: observed.milestones.length,
+    templates: observed.templates.length,
+    files: observed.files.length,
     project: observed.project
       ? {
           title: observed.project.title,
@@ -774,7 +824,7 @@ function main() {
     const config = loadConfig(path.resolve(args.config));
     const repoDir = path.resolve(args.repoDir);
     const target = validateLocalTarget(config, repoDir);
-    const observed = discover(config, repoDir);
+    const observed = discover(config, target.repoDir);
     const plan = buildPlan(config, observed);
     const authorization = authorizationValue({
       config,
@@ -791,11 +841,12 @@ function main() {
       report.success = true;
       printReport(report);
     } else {
-      preflightTemplateDestinations(config, repoDir, () =>
-        applyLabels(config, observed, report),
-      );
+      preflightTemplateDestinations(config, target.repoDir, () => {
+        installManagedFiles(config, target.repoDir, observed.files, report);
+        applyLabels(config, observed, report);
+      });
       applyMilestones(config, observed, report);
-      installTemplates(config, repoDir, report);
+      installTemplates(config, target.repoDir, report);
       if (!config.project) {
         report.success = true;
         printReport(report);
@@ -803,7 +854,7 @@ function main() {
       }
       const project = ensureProject(config, observed, report);
       const linked = linkProject(config, observed, project, report);
-      const refreshed = discover(config, repoDir);
+      const refreshed = discover(config, target.repoDir);
       if (
         !refreshed.project ||
         refreshed.project.id !== project.id ||

@@ -16,8 +16,11 @@ Use for repeatable GitHub repository setup. Treat `assets/config.schema.json` as
 ## Hard Rules
 
 - Infer repository, account, stack, and existing governance facts before asking. Ask only unresolved values through open-ended input; never invent governance.
-- Generate a reviewed manifest from the confirmed facts. Resource modules are optional: labels, milestones, fixed templates, and Projects v2. Omit an unwanted module; the normalized manifest disables it.
+- Generate a reviewed manifest from the confirmed facts. Resource modules are optional: labels, milestones, generic repository files, legacy templates, and Projects v2. Omit an unwanted module; the normalized manifest disables it.
 - Preserve configured resources: discover before every ensure, create missing resources, update only `managed: true` resources or templates with `mode: "replace"`, and never delete.
+- Configure generic repository files through the top-level `files` map: repository-relative destination keys and `source` values, each with explicit `ensure` or `replace`. Preflight sources and destinations under the actual repository root; reject absolute paths, traversal, symbolic links, non-regular files, and unsafe parents.
+- Plan source and destination SHA-256 state. `ensure` creates only missing files; `replace` creates missing files and updates differing bytes. Apply only the exact authorized plan.
+- Legacy `templates` remains accepted and operates unchanged during this transition; it may be configured alongside `files`.
 - Keep the fixed template set only: `bug_report`, `feature_request`, and the pull-request template. Arbitrary managed template files are out of scope.
 - Run `plan` before mutation. Apply only after explicit authorization with the exact SHA-256 value from that reviewed plan; never reuse it after any config, target, discovery, or plan change.
 - Require `gh`, authentication, applicable scopes, target access, and valid configuration before mutation. Run Projects v2 discovery, GraphQL, and mutations only when `project` is configured.

@@ -17,6 +17,8 @@ export const LIMITS = Object.freeze({
   milestones: 50,
   milestoneTitleLength: 255,
   milestoneDescriptionLength: 1000,
+  files: 100,
+  filePathLength: 1024,
   issueFormLabels: 10,
   projectTitleLength: 255,
   fields: 20,
@@ -109,6 +111,7 @@ export function validationErrors(config) {
     "requiredScopes",
     "labels",
     "milestones",
+    "files",
     "templates",
     "project",
   ]);
@@ -222,6 +225,28 @@ export function validationErrors(config) {
         );
       if ("managed" in milestone && typeof milestone.managed !== "boolean")
         add(`$.milestones.${title}.managed`, "must be boolean");
+    }
+  }
+
+  if (
+    config.files !== undefined &&
+    resourceMap(config.files, "$.files", LIMITS.files)
+  ) {
+    for (const [destination, file] of Object.entries(config.files)) {
+      if (!isRepositoryRelativePath(destination))
+        add(
+          `$.files.${destination}`,
+          "must be a repository-relative path without traversal",
+        );
+      if (!object(file, `$.files.${destination}`)) continue;
+      known(file, `$.files.${destination}`, ["source", "mode"]);
+      if (!isRepositoryRelativePath(file.source))
+        add(
+          `$.files.${destination}.source`,
+          "must be a repository-relative path without traversal",
+        );
+      if (!["ensure", "replace"].includes(file.mode))
+        add(`$.files.${destination}.mode`, "must be ensure or replace");
     }
   }
 
@@ -430,6 +455,7 @@ export function normalizeConfig(config) {
       "title",
       (milestone) => ({ ...milestone, managed: milestone.managed === true }),
     ),
+    files: normalizeResourceMap(config.files ?? {}, "destination"),
     templates: config.templates ? { ...config.templates } : null,
     project: config.project
       ? {
@@ -579,6 +605,17 @@ export function projectFieldMatches(existing, configured) {
   });
 }
 
+function isRepositoryRelativePath(value) {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= LIMITS.filePathLength &&
+    !path.isAbsolute(value) &&
+    !path.win32.isAbsolute(value) &&
+    value.split(/[\\/]/).every((part) => part && part !== "." && part !== "..")
+  );
+}
+
 function isWithin(root, target) {
   const relative = path.relative(root, target);
   return (
@@ -594,6 +631,124 @@ function lstatIfPresent(target) {
   } catch (error) {
     if (error.code === "ENOENT") return null;
     throw error;
+  }
+}
+
+function managedPath(repoDir, relativePath, role) {
+  if (!isRepositoryRelativePath(relativePath))
+    throw new Error(
+      `${role} must be a repository-relative path without traversal: ${relativePath}`,
+    );
+  const repoRoot = fs.realpathSync(repoDir);
+  const target = path.resolve(repoRoot, relativePath);
+  if (!isWithin(repoRoot, target) || target === repoRoot)
+    throw new Error(`${role} escapes repository root: ${relativePath}`);
+  const components = path.relative(repoRoot, target).split(path.sep);
+  let current = repoRoot;
+  for (const [index, component] of components.entries()) {
+    current = path.join(current, component);
+    const entry = lstatIfPresent(current);
+    if (entry?.isSymbolicLink())
+      throw new Error(`${role} contains a symbolic link: ${relativePath}`);
+    if (entry && index < components.length - 1 && !entry.isDirectory())
+      throw new Error(`${role} parent is not a directory: ${relativePath}`);
+    if (index === components.length - 1 && entry && !entry.isFile())
+      throw new Error(`${role} is not a regular file: ${relativePath}`);
+  }
+  return { repoRoot, target, exists: lstatIfPresent(target) !== null };
+}
+
+function sha256(content) {
+  return createHash("sha256").update(content).digest("hex");
+}
+
+function configuredFiles(config) {
+  const files = Array.isArray(config.files)
+    ? config.files
+    : Object.entries(config.files ?? {}).map(([destination, file]) => ({
+        destination,
+        ...file,
+      }));
+  return [...files].sort((left, right) =>
+    left.destination.localeCompare(right.destination),
+  );
+}
+
+function rejectConflictingDestinations(files, repoRoot) {
+  for (const [index, file] of files.entries()) {
+    const ancestor = path.resolve(repoRoot, file.destination);
+    for (const descendantFile of files.slice(index + 1)) {
+      const descendant = path.resolve(repoRoot, descendantFile.destination);
+      if (isWithin(ancestor, descendant))
+        throw new Error(
+          `Managed file destination ${JSON.stringify(file.destination)} is an ancestor of ${JSON.stringify(descendantFile.destination)}`,
+        );
+    }
+  }
+}
+
+export function preflightManagedFiles(config, repoDir, mutate = () => {}) {
+  const repoRoot = fs.realpathSync(repoDir);
+  const configured = configuredFiles(config);
+  rejectConflictingDestinations(configured, repoRoot);
+  const files = configured.map((file) => {
+    const source = managedPath(repoDir, file.source, "Managed file source");
+    if (!source.exists)
+      throw new Error(`Managed file source is missing: ${file.source}`);
+    const destination = managedPath(
+      repoDir,
+      file.destination,
+      "Managed file destination",
+    );
+    const sourceContent = fs.readFileSync(source.target);
+    const destinationContent = destination.exists
+      ? fs.readFileSync(destination.target)
+      : null;
+    return {
+      ...file,
+      sourceHash: sha256(sourceContent),
+      destinationHash:
+        destinationContent === null ? null : sha256(destinationContent),
+      sourceContent,
+      repoRoot: source.repoRoot,
+      destinationTarget: destination.target,
+    };
+  });
+  mutate();
+  return files;
+}
+
+export function managedFileStates(config, repoDir) {
+  return preflightManagedFiles(config, repoDir).map((file) => ({
+    destination: file.destination,
+    source: file.source,
+    mode: file.mode,
+    sourceHash: file.sourceHash,
+    destinationHash: file.destinationHash,
+  }));
+}
+
+export function writeManagedFile(file) {
+  fs.mkdirSync(path.dirname(file.destinationTarget), { recursive: true });
+  const destination = managedPath(
+    file.repoRoot,
+    file.destination,
+    "Managed file destination",
+  );
+  const descriptor = fs.openSync(
+    destination.target,
+    fs.constants.O_WRONLY |
+      fs.constants.O_CREAT |
+      (file.mode === "ensure" && file.destinationHash === null
+        ? fs.constants.O_EXCL
+        : fs.constants.O_TRUNC) |
+      (fs.constants.O_NOFOLLOW ?? 0),
+    0o666,
+  );
+  try {
+    fs.writeFileSync(descriptor, file.sourceContent);
+  } finally {
+    fs.closeSync(descriptor);
   }
 }
 
@@ -674,6 +829,8 @@ export function emptyReport(mode = "unknown") {
     discovered: {
       labels: 0,
       milestones: 0,
+      templates: 0,
+      files: 0,
       project: null,
       viewsSupported: null,
     },
@@ -756,6 +913,26 @@ export function buildPlan(config, observed = {}) {
             : "existing resource is unmanaged",
         ),
       );
+  }
+  const files = new Map(
+    (observed.files ?? []).map((file) => [file.destination, file]),
+  );
+  for (const file of sortedByIdentity(config.files, "destination")) {
+    const actual = files.get(file.destination);
+    const missing = !actual || actual.destinationHash === null;
+    const differs = !missing && actual.destinationHash !== actual.sourceHash;
+    let fileAction = "skip";
+    let reason = "already matches source";
+    if (missing) {
+      fileAction = "create";
+      reason = "missing";
+    } else if (file.mode === "ensure") {
+      reason = "existing file is unmanaged in ensure mode";
+    } else if (differs) {
+      fileAction = "update";
+      reason = "managed replacement differs";
+    }
+    plan.push(action("file", file.destination, fileAction, reason));
   }
   const desiredTemplates = [];
   if (config.templates) {

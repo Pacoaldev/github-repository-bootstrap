@@ -18,10 +18,12 @@ import {
   normalizeConfig,
   normalizeGitHubOrigin,
   parseOAuthScopes,
+  preflightManagedFiles,
   repositoryBindingMatches,
   resolveProjectByTitle,
   resolveProjectViewByName,
   validationErrors,
+  writeManagedFile,
   writeTemplateFile,
 } from "../scripts/lib.mjs";
 
@@ -38,6 +40,10 @@ const configuration = {
     issueFormLabels: { bug_report: ["type:bug"] },
     pullRequest: true,
     mode: "ensure",
+  },
+  files: {
+    ".github/CODEOWNERS": { source: "governance/CODEOWNERS", mode: "ensure" },
+    ".github/workflows/ci.yml": { source: "governance/ci.yml", mode: "replace" },
   },
   project: {
     title: "Particle Studio",
@@ -183,6 +189,8 @@ test("runtime validation enforces schema limits and canonical map identities", (
   assert.equal(schema.$defs.field.properties.options.maxItems, LIMITS.options);
   assert.equal(schema.$defs.field.properties.options.uniqueItems, true);
   assert.equal(schema.$defs.field.properties.options.items.pattern, "^[^,]+$");
+  assert.equal(schema.$defs.files.maxProperties, LIMITS.files);
+  assert.deepEqual(validationErrors(configuration), []);
 });
 
 test("existing project fields skip only when their configuration matches", () => {
@@ -277,6 +285,87 @@ test("template destinations reject symbolic links and permit regular in-reposito
   }
 });
 
+test("generic files are hashed, safely written, and reject unsafe paths", () => {
+  const temporaryDirectory = fs.mkdtempSync(
+    path.join(skillRoot, "tests", ".managed-files-"),
+  );
+  try {
+    const repository = path.join(temporaryDirectory, "repository");
+    fs.mkdirSync(path.join(repository, "governance"), { recursive: true });
+    fs.writeFileSync(path.join(repository, "governance", "CODEOWNERS"), "* @acme");
+    const files = {
+      ".github/CODEOWNERS": {
+        source: "governance/CODEOWNERS",
+        mode: "replace",
+      },
+    };
+    const [file] = preflightManagedFiles({ files }, repository);
+    assert.match(file.sourceHash, /^[a-f0-9]{64}$/);
+    assert.equal(file.destinationHash, null);
+    writeManagedFile(file);
+    assert.equal(
+      fs.readFileSync(path.join(repository, ".github", "CODEOWNERS"), "utf8"),
+      "* @acme",
+    );
+    assert.equal(
+      preflightManagedFiles({ files }, repository)[0].destinationHash,
+      file.sourceHash,
+    );
+
+    const ensure = { source: "governance/CODEOWNERS", mode: "ensure" };
+    assert.throws(
+      () =>
+        preflightManagedFiles(
+          { files: { managed: ensure, "managed/child": ensure } },
+          repository,
+          () => {
+            throw new Error("mutation reached");
+          },
+        ),
+      /is an ancestor of/,
+    );
+
+    const [racedFile] = preflightManagedFiles(
+      { files: { ".github/raced": ensure } },
+      repository,
+    );
+    const racedDestination = path.join(repository, ".github", "raced");
+    fs.writeFileSync(racedDestination, "unmanaged");
+    assert.throws(() => writeManagedFile(racedFile), /EEXIST/);
+    assert.equal(fs.readFileSync(racedDestination, "utf8"), "unmanaged");
+
+    fs.symlinkSync(
+      temporaryDirectory,
+      path.join(repository, "linked-destination"),
+    );
+    assert.throws(
+      () =>
+        preflightManagedFiles(
+          {
+            files: {
+              "linked-destination/CODEOWNERS": {
+                source: "governance/CODEOWNERS",
+                mode: "ensure",
+              },
+            },
+          },
+          repository,
+        ),
+      /symbolic link/,
+    );
+    assert.throws(
+      () =>
+        preflightManagedFiles(
+          { files: { ".gitignore": { source: "../outside", mode: "ensure" } } },
+          repository,
+        ),
+      /repository-relative path without traversal/,
+    );
+  } finally {
+    fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
 test("legacy resource arrays fail clearly instead of silently accepting duplicate identities", () => {
   const invalid = structuredClone(configuration);
   invalid.labels = [
@@ -299,6 +388,10 @@ test("normalization sorts resource maps before plan generation", () => {
     "type:bug": configuration.labels["type:bug"],
   };
   reversed.milestones = { Zebra: {}, Foundation: {} };
+  reversed.files = {
+    ".github/workflows/ci.yml": configuration.files[".github/workflows/ci.yml"],
+    ".github/CODEOWNERS": configuration.files[".github/CODEOWNERS"],
+  };
   reversed.project.fields = {
     "Target date": { dataType: "DATE" },
     Priority: configuration.project.fields.Priority,
@@ -315,6 +408,10 @@ test("normalization sorts resource maps before plan generation", () => {
   assert.deepEqual(
     normalized.milestones.map((milestone) => milestone.title),
     ["Foundation", "Zebra"],
+  );
+  assert.deepEqual(
+    normalized.files.map((file) => file.destination),
+    [".github/CODEOWNERS", ".github/workflows/ci.yml"],
   );
   assert.deepEqual(
     normalized.project.fields.map((field) => field.name),
@@ -334,6 +431,10 @@ test("plan creates missing resources and preserves unmanaged existing resources"
       { name: "priority:high", color: "FFFFFF", description: "Different" },
     ],
     milestones: [{ title: "Foundation", description: null, dueOn: null }],
+    files: [
+      { destination: ".github/CODEOWNERS", sourceHash: "new", destinationHash: "old" },
+      { destination: ".github/workflows/ci.yml", sourceHash: "new", destinationHash: "old" },
+    ],
     templates: [".github/ISSUE_TEMPLATE/bug_report.yml"],
     project: {
       id: "PVT_kwDOExample",
@@ -372,6 +473,10 @@ test("plan creates missing resources and preserves unmanaged existing resources"
   assert.equal(
     plan.some((entry) => entry.target === ".github/ISSUE_TEMPLATE/config.yml"),
     true,
+  );
+  assert.deepEqual(
+    plan.filter((entry) => entry.resource === "file").map((entry) => [entry.target, entry.action]),
+    [[".github/CODEOWNERS", "skip"], [".github/workflows/ci.yml", "update"]],
   );
 });
 
@@ -532,6 +637,15 @@ test("authorization hash binds the exact canonical plan inputs", () => {
       labels: [],
       milestones: [],
       templates: [],
+      files: [
+        {
+          destination: ".github/CODEOWNERS",
+          source: "governance/CODEOWNERS",
+          mode: "ensure",
+          sourceHash: "source-v1",
+          destinationHash: null,
+        },
+      ],
       project: null,
       fields: [],
       views: [],
@@ -562,6 +676,8 @@ test("authorization hash binds the exact canonical plan inputs", () => {
   const changed = structuredClone(inputs);
   changed.observed.repositoryId = "R_2";
   assert.notEqual(authorizationValue(changed), authorization);
+  changed.observed.files[0].sourceHash = "source-v2";
+  assert.notEqual(authorizationValue(changed), authorization);
 });
 
 test("failure reports always retain the declared machine-readable shape", () => {
@@ -587,9 +703,11 @@ test("failure reports always retain the declared machine-readable shape", () => 
     true,
   );
   assert.deepEqual(Object.keys(report.discovered).sort(), [
+    "files",
     "labels",
     "milestones",
     "project",
+    "templates",
     "viewsSupported",
   ]);
 });
