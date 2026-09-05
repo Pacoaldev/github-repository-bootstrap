@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -97,7 +98,7 @@ test("minimal config disables omitted resource families without project API work
   assert.deepEqual(buildPlan(normalized), []);
 
   const temporaryDirectory = fs.mkdtempSync(
-    path.join(skillRoot, "tests", ".minimal-config-"),
+    path.join(os.tmpdir(), "github-repository-bootstrap-minimal-config-"),
   );
   try {
     const repository = path.join(temporaryDirectory, "repository");
