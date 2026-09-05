@@ -1,0 +1,31 @@
+{
+  "name": "github-repository-bootstrap",
+  "version": "1.0.0",
+  "description": "Reusable Pi skill for safe, repeatable GitHub repository bootstrap.",
+  "private": true,
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "github",
+    "repository-bootstrap",
+    "governance"
+  ],
+  "scripts": {
+    "test": "node --test skills/github-repository-bootstrap/tests/lib.test.mjs"
+  },
+  "pi": {
+    "skills": [
+      "./skills/github-repository-bootstrap"
+    ]
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/egdev6/github-repository-bootstrap.git"
+  },
+  "bugs": {
+    "url": "https://github.com/egdev6/github-repository-bootstrap/issues"
+  },
+  "homepage": "https://github.com/egdev6/github-repository-bootstrap#readme"
+}
