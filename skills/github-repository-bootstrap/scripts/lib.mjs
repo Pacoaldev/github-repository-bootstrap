@@ -634,6 +634,90 @@ function lstatIfPresent(target) {
   }
 }
 
+function sameFile(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+const approvedRoots = new Map();
+
+function approvedRoot(repoDir) {
+  const key = path.resolve(repoDir);
+  if (!approvedRoots.has(key)) {
+    const repoRoot = fs.realpathSync(repoDir);
+    approvedRoots.set(key, { repoRoot, identity: fs.statSync(repoRoot) });
+  }
+  return approvedRoots.get(key);
+}
+
+function descriptorPath(descriptor, name = ".") {
+  return `/proc/self/fd/${descriptor}/${name}`;
+}
+
+function requireDescriptorRelativeSupport() {
+  const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW;
+  if (process.platform !== "linux" || !fs.constants.O_DIRECTORY || !fs.constants.O_NOFOLLOW)
+    throw new Error("Safe managed writes require Linux descriptor-relative filesystem support");
+  let descriptor;
+  try {
+    descriptor = fs.openSync("/proc/self/fd", flags);
+    const probe = fs.openSync(descriptorPath(descriptor), flags);
+    try {
+      if (!sameFile(fs.fstatSync(descriptor), fs.fstatSync(probe)))
+        throw new Error("Safe managed writes cannot verify /proc descriptor traversal");
+    } finally {
+      fs.closeSync(probe);
+    }
+  } catch (error) {
+    throw new Error("Safe managed writes require verified /proc descriptor traversal", { cause: error });
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
+}
+
+function openWriteDescriptor(repoRoot, rootIdentity, relativePath, exclusive) {
+  requireDescriptorRelativeSupport();
+  const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW;
+  let parent = fs.openSync(repoRoot, flags);
+  let descriptor;
+  try {
+    if (!sameFile(rootIdentity, fs.fstatSync(parent)))
+      throw new Error("Managed repository root changed while opening its descriptor");
+    const components = relativePath.split(path.sep);
+    for (const component of components.slice(0, -1)) {
+      let next;
+      try {
+        next = fs.openSync(descriptorPath(parent, component), flags);
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+        try {
+          fs.mkdirSync(descriptorPath(parent, component));
+        } catch (mkdirError) {
+          if (mkdirError.code !== "EEXIST") throw mkdirError;
+        }
+        next = fs.openSync(descriptorPath(parent, component), flags);
+      }
+      fs.closeSync(parent);
+      parent = next;
+    }
+    const target = descriptorPath(parent, components.at(-1));
+    const writeFlags = fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW;
+    try {
+      descriptor = fs.openSync(target, writeFlags | (exclusive ? fs.constants.O_CREAT | fs.constants.O_EXCL : 0), 0o666);
+    } catch (error) {
+      if (exclusive || error.code !== "ENOENT") throw error;
+      descriptor = fs.openSync(target, writeFlags | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o666);
+    }
+    if (!fs.fstatSync(descriptor).isFile())
+      throw new Error(`Managed destination is not a regular file: ${relativePath}`);
+    return descriptor;
+  } catch (error) {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+    throw error;
+  } finally {
+    fs.closeSync(parent);
+  }
+}
+
 function managedPath(repoDir, relativePath, role) {
   if (!isRepositoryRelativePath(relativePath))
     throw new Error(
@@ -688,7 +772,8 @@ function rejectConflictingDestinations(files, repoRoot) {
 }
 
 export function preflightManagedFiles(config, repoDir, mutate = () => {}) {
-  const repoRoot = fs.realpathSync(repoDir);
+  const root = approvedRoot(repoDir);
+  const repoRoot = root.repoRoot;
   const configured = configuredFiles(config);
   rejectConflictingDestinations(configured, repoRoot);
   const files = configured.map((file) => {
@@ -710,7 +795,8 @@ export function preflightManagedFiles(config, repoDir, mutate = () => {}) {
       destinationHash:
         destinationContent === null ? null : sha256(destinationContent),
       sourceContent,
-      repoRoot: source.repoRoot,
+      repoRoot,
+      rootIdentity: root.identity,
       destinationTarget: destination.target,
     };
   });
@@ -729,23 +815,14 @@ export function managedFileStates(config, repoDir) {
 }
 
 export function writeManagedFile(file) {
-  fs.mkdirSync(path.dirname(file.destinationTarget), { recursive: true });
-  const destination = managedPath(
+  const descriptor = openWriteDescriptor(
     file.repoRoot,
+    file.rootIdentity,
     file.destination,
-    "Managed file destination",
-  );
-  const descriptor = fs.openSync(
-    destination.target,
-    fs.constants.O_WRONLY |
-      fs.constants.O_CREAT |
-      (file.mode === "ensure" && file.destinationHash === null
-        ? fs.constants.O_EXCL
-        : fs.constants.O_TRUNC) |
-      (fs.constants.O_NOFOLLOW ?? 0),
-    0o666,
+    file.mode === "ensure" && file.destinationHash === null,
   );
   try {
+    fs.ftruncateSync(descriptor, 0);
     fs.writeFileSync(descriptor, file.sourceContent);
   } finally {
     fs.closeSync(descriptor);
@@ -753,7 +830,7 @@ export function writeManagedFile(file) {
 }
 
 export function templateDestination(repoDir, relativePath) {
-  const repoRoot = fs.realpathSync(repoDir);
+  const { repoRoot, identity: rootIdentity } = approvedRoot(repoDir);
   const target = path.resolve(repoRoot, relativePath);
   if (!isWithin(repoRoot, target) || target === repoRoot)
     throw new Error(
@@ -768,31 +845,24 @@ export function templateDestination(repoDir, relativePath) {
         `Template destination contains a symbolic link: ${relativePath}`,
       );
   }
-  return { repoRoot, target, exists: lstatIfPresent(target) !== null };
+  return { repoRoot, rootIdentity, target, exists: lstatIfPresent(target) !== null };
 }
 
 export function writeTemplateFile(repoDir, relativePath, content) {
   const destination = templateDestination(repoDir, relativePath);
-  fs.mkdirSync(path.dirname(destination.target), { recursive: true });
-  const verified = templateDestination(destination.repoRoot, relativePath);
-  const parent = fs.realpathSync(path.dirname(verified.target));
-  if (!isWithin(verified.repoRoot, parent))
-    throw new Error(`Template parent escapes repository root: ${relativePath}`);
-  const noFollow = fs.constants.O_NOFOLLOW ?? 0;
-  const descriptor = fs.openSync(
-    verified.target,
-    fs.constants.O_WRONLY |
-      fs.constants.O_CREAT |
-      fs.constants.O_TRUNC |
-      noFollow,
-    0o666,
+  const descriptor = openWriteDescriptor(
+    destination.repoRoot,
+    destination.rootIdentity,
+    path.relative(destination.repoRoot, destination.target),
+    false,
   );
   try {
+    fs.ftruncateSync(descriptor, 0);
     fs.writeFileSync(descriptor, content, "utf8");
   } finally {
     fs.closeSync(descriptor);
   }
-  return verified.exists;
+  return destination.exists;
 }
 
 export function canonicalJson(value) {

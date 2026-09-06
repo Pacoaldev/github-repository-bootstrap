@@ -21,6 +21,7 @@ import {
   parseOAuthScopes,
   preflightManagedFiles,
   repositoryBindingMatches,
+  templateDestination,
   resolveProjectByTitle,
   resolveProjectViewByName,
   validationErrors,
@@ -66,6 +67,17 @@ function errorsFor(config) {
 
 function messagesFor(config) {
   return validationErrors(config).map((error) => error.message);
+}
+
+function preparedWrite(repository, kind, target = ".github/managed.yml") {
+  if (kind === "template") {
+    templateDestination(repository, target);
+    return () => writeTemplateFile(repository, target, "template");
+  }
+  fs.mkdirSync(path.join(repository, "governance"), { recursive: true });
+  fs.writeFileSync(path.join(repository, "governance/source.yml"), "managed");
+  const [file] = preflightManagedFiles({ files: { [target]: { source: "governance/source.yml", mode: "replace" } } }, repository);
+  return () => writeManagedFile(file);
 }
 
 test("minimal config disables omitted resource families without project API work", () => {
@@ -286,6 +298,139 @@ test("template destinations reject symbolic links and permit regular in-reposito
   }
 });
 
+test("descriptor-relative writes confine ancestor and missing-parent swaps", () => {
+  const temporaryDirectory = fs.mkdtempSync(path.join(skillRoot, "tests", ".ancestor-swap-"));
+  const target = ".github/managed.yml";
+  const confined = (kind, exists) => {
+    const repository = path.join(temporaryDirectory, `${kind}-${exists}`);
+    const outside = path.join(temporaryDirectory, `${kind}-${exists}-outside`);
+    const parent = path.join(repository, ".github");
+    const external = path.join(outside, "managed.yml");
+    fs.mkdirSync(parent, { recursive: true }); fs.mkdirSync(outside);
+    if (exists) fs.writeFileSync(path.join(parent, "managed.yml"), "inside"), fs.writeFileSync(external, "outside");
+    const openSync = fs.openSync;
+    fs.openSync = function (name, ...args) {
+      if (!/^\/proc\/self\/fd\/\d+\/managed\.yml$/.test(name)) return openSync.call(this, name, ...args);
+      const saved = `${parent}-saved`;
+      fs.renameSync(parent, saved); fs.symlinkSync(outside, parent);
+      try { return openSync.call(this, name, ...args); }
+      finally { fs.unlinkSync(parent); fs.renameSync(saved, parent); }
+    };
+    try { assert.doesNotThrow(preparedWrite(repository, kind)); }
+    finally { fs.openSync = openSync; }
+    assert.equal(fs.readFileSync(path.join(parent, "managed.yml"), "utf8"), kind);
+    assert.equal(fs.existsSync(external) ? fs.readFileSync(external, "utf8") : null, exists ? "outside" : null);
+  };
+  try {
+    for (const kind of ["managed", "template"]) for (const exists of [true, false]) confined(kind, exists);
+    const repository = path.join(temporaryDirectory, "missing-parent");
+    const parent = path.join(repository, ".github"); const outside = `${repository}-outside`;
+    fs.mkdirSync(parent, { recursive: true }); fs.mkdirSync(outside);
+    const mkdirSync = fs.mkdirSync;
+    fs.mkdirSync = function (name, ...args) {
+      if (!/^\/proc\/self\/fd\/\d+\/new-parent$/.test(name)) return mkdirSync.call(this, name, ...args);
+      const saved = `${parent}-saved`;
+      fs.renameSync(parent, saved); fs.symlinkSync(outside, parent);
+      try { return mkdirSync.call(this, name, ...args); }
+      finally { fs.unlinkSync(parent); fs.renameSync(saved, parent); }
+    };
+    try { preparedWrite(repository, "template", ".github/new-parent/managed.yml")(); }
+    finally { fs.mkdirSync = mkdirSync; }
+    assert.equal(fs.readFileSync(path.join(parent, "new-parent/managed.yml"), "utf8"), "template");
+    assert.equal(fs.existsSync(path.join(outside, "new-parent")), false);
+  } finally { fs.rmSync(temporaryDirectory, { recursive: true, force: true }); }
+});
+
+test("approved root identity rejects replacement before managed or template mutation", () => {
+  const temporaryDirectory = fs.mkdtempSync(path.join(skillRoot, "tests", ".root-swap-"));
+  const confined = (kind, exists) => {
+    const repository = path.join(temporaryDirectory, `${kind}-${exists}`);
+    const outside = `${repository}-outside`; const target = ".github/managed.yml";
+    const external = path.join(outside, target);
+    fs.mkdirSync(path.join(repository, ".github"), { recursive: true }); fs.mkdirSync(path.dirname(external), { recursive: true });
+    if (exists) fs.writeFileSync(path.join(repository, target), "inside"), fs.writeFileSync(external, "outside");
+    const write = preparedWrite(repository, kind); const { openSync, realpathSync, statSync } = fs;
+    const saved = `${repository}-saved`; let swapped = false;
+    const swap = () => { if (!swapped) fs.renameSync(repository, saved), fs.renameSync(outside, repository), swapped = true; };
+    fs.openSync = function (name, ...args) { if (name === repository) swap(); return openSync.call(this, name, ...args); };
+    fs.realpathSync = function (name, ...args) { if (name === repository) swap(); return realpathSync.call(this, name, ...args); };
+    fs.statSync = function (name, ...args) { if (name === repository) swap(); return statSync.call(this, name, ...args); };
+    try { assert.throws(write, /root changed/); } finally {
+      fs.openSync = openSync; fs.realpathSync = realpathSync; fs.statSync = statSync;
+      if (swapped) fs.renameSync(repository, outside), fs.renameSync(saved, repository);
+    }
+    assert.equal(fs.existsSync(external) ? fs.readFileSync(external, "utf8") : null, exists ? "outside" : null);
+  };
+  try { for (const kind of ["managed", "template"]) for (const exists of [true, false]) confined(kind, exists); }
+  finally { fs.rmSync(temporaryDirectory, { recursive: true, force: true }); }
+});
+
+test("non-Linux platforms reject managed and template writes before filesystem access", () => {
+  const temporaryDirectory = fs.mkdtempSync(path.join(skillRoot, "tests", ".non-linux-write-"));
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  assert.equal(platform?.configurable, true);
+  const rejected = (kind, exists) => {
+    const repository = path.join(temporaryDirectory, `${kind}-${exists}`);
+    const outside = path.join(temporaryDirectory, `${kind}-${exists}-outside`);
+    const ancestor = path.join(repository, ".github");
+    const target = path.join(ancestor, "managed.yml");
+    const external = path.join(outside, "managed.yml");
+    fs.mkdirSync(repository); fs.mkdirSync(outside);
+    if (exists) {
+      fs.mkdirSync(ancestor);
+      fs.writeFileSync(target, "inside");
+      fs.writeFileSync(external, "outside");
+    }
+    const write = preparedWrite(repository, kind); const openSync = fs.openSync; let opens = 0;
+    fs.openSync = function (...args) { opens += 1; return openSync.call(this, ...args); };
+    Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
+    try { assert.throws(write, /require Linux descriptor-relative/); }
+    finally { Object.defineProperty(process, "platform", platform); fs.openSync = openSync; }
+    assert.equal(opens, 0);
+    assert.equal(fs.existsSync(ancestor), exists);
+    assert.equal(fs.existsSync(target) ? fs.readFileSync(target, "utf8") : null, exists ? "inside" : null);
+    assert.equal(fs.existsSync(external) ? fs.readFileSync(external, "utf8") : null, exists ? "outside" : null);
+  };
+  try { for (const kind of ["managed", "template"]) for (const exists of [true, false]) rejected(kind, exists); }
+  finally { fs.rmSync(temporaryDirectory, { recursive: true, force: true }); }
+});
+
+test("descriptor support fails closed and traversal failures close every descriptor", () => {
+  const temporaryDirectory = fs.mkdtempSync(path.join(skillRoot, "tests", ".descriptor-support-"));
+  const blocked = (kind, failure) => {
+    const repository = path.join(temporaryDirectory, `${kind}-${failure}`); fs.mkdirSync(repository);
+    const write = preparedWrite(repository, kind); const { openSync, fstatSync } = fs;
+    if (failure === "proc") fs.openSync = function (name, ...args) {
+      if (name === "/proc/self/fd") throw Object.assign(new Error("missing proc"), { code: "ENOENT" });
+      return openSync.call(this, name, ...args);
+    };
+    else {
+      let reads = 0;
+      fs.fstatSync = function (descriptor) {
+        const stat = fstatSync.call(this, descriptor);
+        return ++reads === 2 ? { ...stat, ino: stat.ino + 1 } : stat;
+      };
+    }
+    try { assert.throws(write, /verified \/proc/); }
+    finally { fs.openSync = openSync; fs.fstatSync = fstatSync; }
+    assert.equal(fs.existsSync(path.join(repository, ".github")), false);
+  };
+  try {
+    for (const failure of ["proc", "identity"]) for (const kind of ["managed", "template"]) blocked(kind, failure);
+    const repository = path.join(temporaryDirectory, "cleanup"); fs.mkdirSync(repository);
+    const { openSync, closeSync } = fs; const openDescriptors = new Set();
+    fs.openSync = function (name, ...args) {
+      if (/^\/proc\/self\/fd\/\d+\/.github$/.test(name)) throw Object.assign(new Error("EACCES blocked"), { code: "EACCES" });
+      const descriptor = openSync.call(this, name, ...args);
+      if (name === repository || String(name).startsWith("/proc/self/fd")) openDescriptors.add(descriptor);
+      return descriptor;
+    };
+    fs.closeSync = function (descriptor) { openDescriptors.delete(descriptor); return closeSync.call(this, descriptor); };
+    try { assert.throws(() => writeTemplateFile(repository, ".github/managed.yml", "unsafe"), /EACCES/); assert.deepEqual([...openDescriptors], []); }
+    finally { fs.openSync = openSync; fs.closeSync = closeSync; }
+  } finally { fs.rmSync(temporaryDirectory, { recursive: true, force: true }); }
+});
+
 test("generic files are hashed, safely written, and reject unsafe paths", () => {
   const temporaryDirectory = fs.mkdtempSync(
     path.join(skillRoot, "tests", ".managed-files-"),
@@ -334,6 +479,15 @@ test("generic files are hashed, safely written, and reject unsafe paths", () => 
     fs.writeFileSync(racedDestination, "unmanaged");
     assert.throws(() => writeManagedFile(racedFile), /EEXIST/);
     assert.equal(fs.readFileSync(racedDestination, "utf8"), "unmanaged");
+
+    const [finalLink] = preflightManagedFiles(
+      { files: { ".github/final-link": { source: "governance/CODEOWNERS", mode: "replace" } } }, repository,
+    );
+    const outsideFinal = path.join(temporaryDirectory, "outside-final");
+    fs.writeFileSync(outsideFinal, "outside");
+    fs.symlinkSync(outsideFinal, path.join(repository, ".github", "final-link"));
+    assert.throws(() => writeManagedFile(finalLink), /ELOOP/);
+    assert.equal(fs.readFileSync(outsideFinal, "utf8"), "outside");
 
     fs.symlinkSync(
       temporaryDirectory,
