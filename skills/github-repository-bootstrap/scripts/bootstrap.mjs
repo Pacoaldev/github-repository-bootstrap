@@ -54,11 +54,33 @@ function unwrapBatchIfPossible(candidate) {
   if (/\.(cmd|bat)$/i.test(candidate)) {
     try {
       const content = fs.readFileSync(candidate, "utf8");
-      const match = /node(?:\.exe)?["\s]+["']?([^"'\r\n]+)["']?/i.exec(content);
-      if (match) {
-        const script = match[1].replace(/%~dp0/g, path.dirname(candidate) + path.sep);
-        const resolvedScript = path.resolve(path.dirname(candidate), script);
-        if (fs.existsSync(resolvedScript)) {
+      const lines = content.split(/\r?\n/);
+      let scriptPath = null;
+      let valid = true;
+
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line) continue;
+
+        if (/^(?:rem\b|::)/i.test(line)) continue;
+        if (/^@?echo\s+off$/i.test(line)) continue;
+        if (/^@?exit(?:\s+\/b(?:\s+(?:%errorlevel%|\d+))?)?$/i.test(line)) continue;
+
+        const nodeExecRegex =
+          /^@?\s*(?:"(?:%~dp0[\\/])?node(?:\.exe)?"|node(?:\.exe)?|"%NODE_EXE%")\s+(?:"((?:%~dp0)?[^"&|<>%^]+)"|((?:%~dp0)?[^\s"&|<>%^]+))(?:\s+%\*)?$/i;
+        const match = nodeExecRegex.exec(line);
+        if (match && !scriptPath) {
+          scriptPath = match[1] || match[2];
+        } else {
+          valid = false;
+          break;
+        }
+      }
+
+      if (valid && scriptPath) {
+        const expanded = scriptPath.replace(/%~dp0/g, path.dirname(candidate) + path.sep);
+        const resolvedScript = path.resolve(path.dirname(candidate), expanded);
+        if (fs.existsSync(resolvedScript) && fs.statSync(resolvedScript).isFile()) {
           return { cmd: process.execPath, args: [resolvedScript] };
         }
       }

@@ -1538,3 +1538,37 @@ test("resolveCommand and run fail closed on unsupported batch script wrappers", 
     fs.rmSync(temporaryDirectory, { recursive: true, force: true });
   }
 });
+
+test("unwrapBatchIfPossible rejects @echo node wrappers and never executes payload", () => {
+  const temporaryDirectory = fs.mkdtempSync(
+    path.join(skillRoot, "tests", ".echo-node-regression-"),
+  );
+  try {
+    const canaryPath = path.join(temporaryDirectory, "canary.txt");
+    const payloadPath = path.join(temporaryDirectory, "payload.js");
+    fs.writeFileSync(
+      payloadPath,
+      `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(canaryPath)}, "executed");\n`,
+    );
+
+    const fakeCmd = path.join(temporaryDirectory, "echo-node.cmd");
+    fs.writeFileSync(fakeCmd, '@echo node "%~dp0payload.js"\r\n');
+
+    assert.throws(
+      () => resolveCommand(fakeCmd),
+      /crosses a command shell boundary/,
+    );
+    assert.throws(
+      () => run(fakeCmd, []),
+      /crosses a command shell boundary/,
+    );
+    assert.equal(
+      fs.existsSync(canaryPath),
+      false,
+      "payload.js must never be executed",
+    );
+  } finally {
+    fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
