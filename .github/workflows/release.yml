@@ -29,10 +29,21 @@ jobs:
       - name: Run tests
         run: npm test
 
+  test-gate:
+    name: test
+    if: ${{ always() }}
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful test matrix
+        env:
+          MATRIX_RESULT: ${{ needs.test.result }}
+        run: test "${MATRIX_RESULT}" = "success"
+
   release:
     name: release
     if: github.event_name == 'push'
-    needs: test
+    needs: test-gate
     runs-on: ubuntu-latest
     permissions:
       contents: write
