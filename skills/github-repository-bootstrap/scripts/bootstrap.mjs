@@ -50,61 +50,25 @@ function parseArgs(argv) {
   return result;
 }
 
-function unwrapBatchIfPossible(candidate) {
+function rejectBatchScript(candidate) {
   if (/\.(cmd|bat)$/i.test(candidate)) {
-    try {
-      const content = fs.readFileSync(candidate, "utf8");
-      const lines = content.split(/\r?\n/);
-      let scriptPath = null;
-      let valid = true;
-
-      for (const rawLine of lines) {
-        const line = rawLine.trim();
-        if (!line) continue;
-
-        if (/^(?:rem\b|::)/i.test(line)) continue;
-        if (/^@?echo\s+off$/i.test(line)) continue;
-        if (/^@?exit(?:\s+\/b(?:\s+(?:%errorlevel%|\d+))?)?$/i.test(line)) continue;
-
-        const nodeExecRegex =
-          /^@?\s*(?:"(?:%~dp0[\\/])?node(?:\.exe)?"|node(?:\.exe)?|"%NODE_EXE%")\s+(?:"((?:%~dp0)?[^"&|<>%^]+)"|((?:%~dp0)?[^\s"&|<>%^]+))(?:\s+%\*)?$/i;
-        const match = nodeExecRegex.exec(line);
-        if (match && !scriptPath) {
-          scriptPath = match[1] || match[2];
-        } else {
-          valid = false;
-          break;
-        }
-      }
-
-      if (valid && scriptPath) {
-        const expanded = scriptPath.replace(/%~dp0/g, path.dirname(candidate) + path.sep);
-        const resolvedScript = path.resolve(path.dirname(candidate), expanded);
-        if (fs.existsSync(resolvedScript) && fs.statSync(resolvedScript).isFile()) {
-          return { cmd: process.execPath, args: [resolvedScript] };
-        }
-      }
-    } catch (error) {
-      if (error.code !== "ENOENT") {
-        // file read error
-      }
-    }
     throw new Error(
       `Unsupported batch script wrapper: ${candidate}. Executing .cmd or .bat files crosses a command shell boundary; provide a direct executable binary (such as gh.exe) instead.`,
     );
   }
-  return { cmd: candidate, args: [] };
 }
 
 export function resolveCommand(command) {
   if (path.isAbsolute(command) || command.includes("/") || command.includes("\\")) {
     if (fs.existsSync(command)) {
-      return unwrapBatchIfPossible(command);
+      rejectBatchScript(command);
+      return { cmd: command, args: [] };
     }
-    for (const ext of [".exe", ".cmd", ".bat"]) {
-      if (fs.existsSync(command + ext)) {
-        return unwrapBatchIfPossible(command + ext);
-      }
+    if (fs.existsSync(command + ".exe")) {
+      return { cmd: command + ".exe", args: [] };
+    }
+    for (const ext of [".cmd", ".bat"]) {
+      if (fs.existsSync(command + ext)) rejectBatchScript(command + ext);
     }
     return { cmd: command, args: [] };
   }
@@ -115,23 +79,25 @@ export function resolveCommand(command) {
       .split(";")
       .map((ext) => ext.toLowerCase());
 
-    let batchError = null;
+    let batchMatch = null;
     for (const dir of pathDirs) {
       if (!dir) continue;
       for (const ext of ["", ...extensions]) {
         const candidate = path.join(dir, command + ext);
         try {
           if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
-            return unwrapBatchIfPossible(candidate);
+            if (/\.(cmd|bat)$/i.test(candidate)) {
+              if (!batchMatch) batchMatch = candidate;
+              continue;
+            }
+            return { cmd: candidate, args: [] };
           }
-        } catch (error) {
-          if (/\.(cmd|bat)$/i.test(candidate)) {
-            batchError = error;
-          }
+        } catch {
+          // Ignore unreadable PATH entries and keep searching.
         }
       }
     }
-    if (batchError) throw batchError;
+    if (batchMatch) rejectBatchScript(batchMatch);
   }
 
   return { cmd: command, args: [] };

@@ -82,6 +82,59 @@ function preparedWrite(repository, kind, target = ".github/managed.yml") {
   return () => writeManagedFile(file);
 }
 
+/** Install a PATH-visible `gh` stub. Windows requires a real .exe (no .cmd/.bat). */
+function installGhStub(bin, ghStubLogic) {
+  const scriptPath = path.join(bin, "gh-stub.cjs");
+  fs.writeFileSync(scriptPath, ghStubLogic);
+
+  if (process.platform !== "win32") {
+    fs.writeFileSync(
+      path.join(bin, "gh"),
+      `#!/usr/bin/env node\n${ghStubLogic}`,
+      { mode: 0o755 },
+    );
+    return;
+  }
+
+  const exePath = path.join(bin, "gh.exe");
+  const csPath = path.join(bin, "gh-launcher.cs");
+  // Stub args in these tests are simple tokens; only the script path needs quoting.
+  const source = `
+using System;
+using System.Diagnostics;
+class Program {
+  static int Main(string[] args) {
+    var psi = new ProcessStartInfo();
+    psi.FileName = ${JSON.stringify(process.execPath)};
+    psi.Arguments = ${JSON.stringify(`"${scriptPath}"`)};
+    foreach (var a in args) { psi.Arguments += " " + a; }
+    psi.UseShellExecute = false;
+    psi.RedirectStandardOutput = true;
+    psi.RedirectStandardError = true;
+    psi.RedirectStandardInput = true;
+    using (var p = Process.Start(psi)) {
+      Console.Write(p.StandardOutput.ReadToEnd());
+      Console.Error.Write(p.StandardError.ReadToEnd());
+      p.WaitForExit();
+      return p.ExitCode;
+    }
+  }
+}
+`;
+  fs.writeFileSync(csPath, source);
+
+  const csc = path.join(
+    process.env.WINDIR || "C:\\Windows",
+    "Microsoft.NET",
+    "Framework64",
+    "v4.0.30319",
+    "csc.exe",
+  );
+  execFileSync(csc, ["/nologo", `/out:${exePath}`, csPath], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
 test("minimal config disables omitted resource families without project API work", () => {
   const minimal = { account: "acme", repository: "acme/widgets" };
   assert.deepEqual(validationErrors(minimal), []);
@@ -123,7 +176,6 @@ test("minimal config disables omitted resource families without project API work
     execFileSync("git", ["init", repository], { stdio: "ignore" });
     execFileSync("git", ["-C", repository, "remote", "add", "origin", "https://github.com/acme/widgets.git"]);
     fs.writeFileSync(configPath, JSON.stringify(minimal));
-    // Write the fake gh stub - cross-platform approach
     const ghStubLogic = `const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.GH_LOG, JSON.stringify(args) + "\\n");
@@ -134,22 +186,7 @@ else if (args.join(" ") === "api repos/acme/widgets") process.stdout.write('{"fu
 else if (args.join(" ") === "api user") process.stdout.write('{"login":"maintainer"}');
 else process.exitCode = 1;
 `;
-
-    if (process.platform === "win32") {
-      // Windows: write gh.cmd that delegates to gh.js
-      fs.writeFileSync(path.join(bin, "gh.js"), ghStubLogic);
-      fs.writeFileSync(
-        path.join(bin, "gh.cmd"),
-        `@node "%~dp0gh.js" %*\r\n`,
-      );
-    } else {
-      // Unix: write gh with shebang
-      fs.writeFileSync(
-        path.join(bin, "gh"),
-        `#!/usr/bin/env node\n${ghStubLogic}`,
-        { mode: 0o755 },
-      );
-    }
+    installGhStub(bin, ghStubLogic);
     const run = (mode, authorize) =>
       spawnSync(
         process.execPath,
@@ -1471,7 +1508,6 @@ test("writeManagedFile preserves file permissions (0755, 0600) on replace", () =
 });
 
 test("bootstrap run() does not interpret shell metacharacters in arguments", () => {
-  // Test direct executable execution through run()
   const directResult = run("node", [
     "-e",
     "console.log(process.argv[1])",
@@ -1479,7 +1515,6 @@ test("bootstrap run() does not interpret shell metacharacters in arguments", () 
   ]).trim();
   assert.equal(directResult, "arg & calc.exe & %PATH% | echo injected");
 
-  // Test batch command wrapper execution through run() and resolveCommand()
   const temporaryDirectory = fs.mkdtempSync(
     path.join(skillRoot, "tests", ".metachar-test-"),
   );
@@ -1490,19 +1525,6 @@ test("bootstrap run() does not interpret shell metacharacters in arguments", () 
       'console.log(JSON.stringify(process.argv.slice(2)));',
     );
 
-    let cmdPath;
-    if (process.platform === "win32") {
-      cmdPath = path.join(temporaryDirectory, "stub.cmd");
-      fs.writeFileSync(cmdPath, `@node "%~dp0stub.js" %*\r\n`);
-    } else {
-      cmdPath = path.join(temporaryDirectory, "stub");
-      fs.writeFileSync(
-        cmdPath,
-        `#!/usr/bin/env node\n${fs.readFileSync(jsPath, "utf8")}`,
-        { mode: 0o755 },
-      );
-    }
-
     const testArgs = [
       "literal & calc.exe",
       "%VAR% & dir",
@@ -1510,15 +1532,34 @@ test("bootstrap run() does not interpret shell metacharacters in arguments", () 
       "<input> > output",
     ];
 
-    const output = run(cmdPath, testArgs);
-    const parsed = JSON.parse(output.trim());
-    assert.deepEqual(parsed, testArgs);
+    if (process.platform === "win32") {
+      const cmdPath = path.join(temporaryDirectory, "stub.cmd");
+      fs.writeFileSync(cmdPath, `@node "%~dp0stub.js" %*\r\n`);
+      assert.throws(
+        () => resolveCommand(cmdPath),
+        /crosses a command shell boundary/,
+      );
+      assert.throws(
+        () => run(cmdPath, testArgs),
+        /crosses a command shell boundary/,
+      );
+    } else {
+      const cmdPath = path.join(temporaryDirectory, "stub");
+      fs.writeFileSync(
+        cmdPath,
+        `#!/usr/bin/env node\n${fs.readFileSync(jsPath, "utf8")}`,
+        { mode: 0o755 },
+      );
+      const output = run(cmdPath, testArgs);
+      const parsed = JSON.parse(output.trim());
+      assert.deepEqual(parsed, testArgs);
+    }
   } finally {
     fs.rmSync(temporaryDirectory, { recursive: true, force: true });
   }
 });
 
-test("resolveCommand and run fail closed on unsupported batch script wrappers", () => {
+test("resolveCommand and run fail closed on every batch script", () => {
   const temporaryDirectory = fs.mkdtempSync(
     path.join(skillRoot, "tests", ".unsupported-batch-"),
   );
@@ -1539,7 +1580,7 @@ test("resolveCommand and run fail closed on unsupported batch script wrappers", 
   }
 });
 
-test("unwrapBatchIfPossible rejects @echo node wrappers and never executes payload", () => {
+test("resolveCommand rejects @echo node wrappers and never executes payload", () => {
   const temporaryDirectory = fs.mkdtempSync(
     path.join(skillRoot, "tests", ".echo-node-regression-"),
   );
@@ -1572,3 +1613,38 @@ test("unwrapBatchIfPossible rejects @echo node wrappers and never executes paylo
   }
 });
 
+test("resolveCommand rejects exit /b wrappers and never executes later Node payload", () => {
+  const temporaryDirectory = fs.mkdtempSync(
+    path.join(skillRoot, "tests", ".exit-b-regression-"),
+  );
+  try {
+    const canaryPath = path.join(temporaryDirectory, "canary.txt");
+    const payloadPath = path.join(temporaryDirectory, "payload.js");
+    fs.writeFileSync(
+      payloadPath,
+      `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(canaryPath)}, "executed");\n`,
+    );
+
+    const fakeCmd = path.join(temporaryDirectory, "early-exit.cmd");
+    fs.writeFileSync(
+      fakeCmd,
+      '@echo off\r\nexit /b 0\r\n@node "%~dp0payload.js" %*\r\n',
+    );
+
+    assert.throws(
+      () => resolveCommand(fakeCmd),
+      /crosses a command shell boundary/,
+    );
+    assert.throws(
+      () => run(fakeCmd, []),
+      /crosses a command shell boundary/,
+    );
+    assert.equal(
+      fs.existsSync(canaryPath),
+      false,
+      "payload.js after exit /b must never be executed",
+    );
+  } finally {
+    fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+});
