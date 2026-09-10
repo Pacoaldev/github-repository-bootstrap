@@ -62,11 +62,14 @@ function unwrapBatchIfPossible(candidate) {
           return { cmd: process.execPath, args: [resolvedScript] };
         }
       }
-    } catch {}
-    return {
-      cmd: process.env.ComSpec || "cmd.exe",
-      args: ["/d", "/c", candidate],
-    };
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        // file read error
+      }
+    }
+    throw new Error(
+      `Unsupported batch script wrapper: ${candidate}. Executing .cmd or .bat files crosses a command shell boundary; provide a direct executable binary (such as gh.exe) instead.`,
+    );
   }
   return { cmd: candidate, args: [] };
 }
@@ -90,6 +93,7 @@ export function resolveCommand(command) {
       .split(";")
       .map((ext) => ext.toLowerCase());
 
+    let batchError = null;
     for (const dir of pathDirs) {
       if (!dir) continue;
       for (const ext of ["", ...extensions]) {
@@ -98,11 +102,14 @@ export function resolveCommand(command) {
           if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
             return unwrapBatchIfPossible(candidate);
           }
-        } catch {
-          // ignore permission errors during PATH scanning
+        } catch (error) {
+          if (/\.(cmd|bat)$/i.test(candidate)) {
+            batchError = error;
+          }
         }
       }
     }
+    if (batchError) throw batchError;
   }
 
   return { cmd: command, args: [] };

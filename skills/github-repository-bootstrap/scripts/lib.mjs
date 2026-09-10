@@ -909,8 +909,7 @@ function safeWriteFileNonLinux(
       { code: "EEXIST" },
     );
 
-  // Step 5 — Atomic write via temp file in validated parent directory, with permission preservation
-  const parentDir = path.dirname(destination);
+  // Step 5 — Atomic write via sibling temp file in validated parent directory, with permission preservation
   const tmp = destination + "." + Math.random().toString(36).slice(2) + ".tmp";
   let fd;
   try {
@@ -930,33 +929,6 @@ function safeWriteFileNonLinux(
       const existingMode = fs.statSync(destination).mode & 0o777;
       fs.chmodSync(tmp, existingMode);
     }
-
-    // Re-verify parent directory containment and symlink-free status before rename
-    const realParent = fs.realpathSync(parentDir);
-    if (!isWithin(realRepoRoot, realParent))
-      throw new Error(
-        `Managed file destination parent escapes repository root: ${relativePath}`,
-      );
-    const parentCheck = lstatIfPresent(parentDir);
-    if (parentCheck?.isSymbolicLink())
-      throw new Error(
-        `Managed file destination contains a symbolic link: ${relativePath}`,
-      );
-
-    // Re-check destination status before atomic rename
-    const preRenameEntry = lstatIfPresent(destination);
-    if (exclusive && preRenameEntry !== null)
-      throw Object.assign(
-        new Error(`Managed file destination already exists: ${relativePath}`),
-        { code: "EEXIST" },
-      );
-    if (preRenameEntry?.isSymbolicLink())
-      throw Object.assign(
-        new Error(
-          `Managed file destination contains a symbolic link: ${relativePath}`,
-        ),
-        { code: "ELOOP" },
-      );
 
     fs.renameSync(tmp, destination);
   } finally {

@@ -24,7 +24,7 @@ Use for repeatable GitHub repository setup. Treat `assets/config.schema.json` as
 - Keep the fixed template set only: `bug_report`, `feature_request`, and the pull-request template. Arbitrary managed template files are out of scope.
 - Run `plan` before mutation. Apply only after explicit authorization with the exact SHA-256 value from that reviewed plan; never reuse it after any config, target, discovery, or plan change.
 - Require `gh`, authentication, applicable scopes, target access, and valid configuration before mutation. Run Projects v2 discovery, GraphQL, and mutations only when `project` is configured.
-- Local managed-file and template writes use Linux descriptor-relative traversal on Linux, and safe-write guards (root-swap detection, canonical path confinement, symlink rejection, atomic writes via temp-file rename, and permission preservation) on macOS and Windows. There is no `--no-safe-write` bypass.
+- Local writes use descriptor-relative traversal on Linux for race-free parent confinement. macOS and Windows provide a narrower guarantee: root confinement, symlink rejection, atomic sibling replacement, and permission preservation. Full TOCTOU race immunity requires Linux descriptor support. There is no bypass flag.
 
 ## Execution Steps
 

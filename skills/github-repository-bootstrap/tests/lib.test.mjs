@@ -312,6 +312,108 @@ test("template destinations reject symbolic links and permit regular in-reposito
   }
 });
 
+test("descriptor-relative writes confine ancestor and missing-parent swaps", { skip: process.platform !== "linux" }, () => {
+  const temporaryDirectory = fs.mkdtempSync(path.join(skillRoot, "tests", ".ancestor-swap-"));
+  const target = ".github/managed.yml";
+  const confined = (kind, exists) => {
+    const repository = path.join(temporaryDirectory, `${kind}-${exists}`);
+    const outside = path.join(temporaryDirectory, `${kind}-${exists}-outside`);
+    const parent = path.join(repository, ".github");
+    const external = path.join(outside, "managed.yml");
+    fs.mkdirSync(parent, { recursive: true }); fs.mkdirSync(outside);
+    if (exists) fs.writeFileSync(path.join(parent, "managed.yml"), "inside"), fs.writeFileSync(external, "outside");
+    const openSync = fs.openSync;
+    fs.openSync = function (name, ...args) {
+      if (!/^\/proc\/self\/fd\/\d+\/managed\.yml$/.test(name)) return openSync.call(this, name, ...args);
+      const saved = `${parent}-saved`;
+      fs.renameSync(parent, saved); fs.symlinkSync(outside, parent);
+      try { return openSync.call(this, name, ...args); }
+      finally { fs.unlinkSync(parent); fs.renameSync(saved, parent); }
+    };
+    try { assert.doesNotThrow(preparedWrite(repository, kind)); }
+    finally { fs.openSync = openSync; }
+    assert.equal(fs.readFileSync(path.join(parent, "managed.yml"), "utf8"), kind);
+    assert.equal(fs.existsSync(external) ? fs.readFileSync(external, "utf8") : null, exists ? "outside" : null);
+  };
+  try {
+    for (const kind of ["managed", "template"]) for (const exists of [true, false]) confined(kind, exists);
+    const repository = path.join(temporaryDirectory, "missing-parent");
+    const parent = path.join(repository, ".github"); const outside = `${repository}-outside`;
+    fs.mkdirSync(parent, { recursive: true }); fs.mkdirSync(outside);
+    const mkdirSync = fs.mkdirSync;
+    fs.mkdirSync = function (name, ...args) {
+      if (!/^\/proc\/self\/fd\/\d+\/new-parent$/.test(name)) return mkdirSync.call(this, name, ...args);
+      const saved = `${parent}-saved`;
+      fs.renameSync(parent, saved); fs.symlinkSync(outside, parent);
+      try { return mkdirSync.call(this, name, ...args); }
+      finally { fs.unlinkSync(parent); fs.renameSync(saved, parent); }
+    };
+    try { preparedWrite(repository, "template", ".github/new-parent/managed.yml")(); }
+    finally { fs.mkdirSync = mkdirSync; }
+    assert.equal(fs.readFileSync(path.join(parent, "new-parent/managed.yml"), "utf8"), "template");
+    assert.equal(fs.existsSync(path.join(outside, "new-parent")), false);
+  } finally { fs.rmSync(temporaryDirectory, { recursive: true, force: true }); }
+});
+
+test("approved root identity rejects replacement before managed or template mutation", () => {
+  const temporaryDirectory = fs.mkdtempSync(path.join(skillRoot, "tests", ".root-swap-"));
+  const confined = (kind, exists) => {
+    const repository = path.join(temporaryDirectory, `${kind}-${exists}`);
+    const outside = `${repository}-outside`; const target = ".github/managed.yml";
+    const external = path.join(outside, target);
+    fs.mkdirSync(path.join(repository, ".github"), { recursive: true }); fs.mkdirSync(path.dirname(external), { recursive: true });
+    if (exists) fs.writeFileSync(path.join(repository, target), "inside"), fs.writeFileSync(external, "outside");
+    const write = preparedWrite(repository, kind); const { openSync, realpathSync, statSync } = fs;
+    const saved = `${repository}-saved`; let swapped = false;
+    const swap = () => { if (!swapped) fs.renameSync(repository, saved), fs.renameSync(outside, repository), swapped = true; };
+    fs.openSync = function (name, ...args) { if (name === repository) swap(); return openSync.call(this, name, ...args); };
+    fs.realpathSync = function (name, ...args) { if (name === repository) swap(); return realpathSync.call(this, name, ...args); };
+    fs.statSync = function (name, ...args) { if (name === repository) swap(); return statSync.call(this, name, ...args); };
+    try { assert.throws(write, /root changed/); } finally {
+      fs.openSync = openSync; fs.realpathSync = realpathSync; fs.statSync = statSync;
+      if (swapped) fs.renameSync(repository, outside), fs.renameSync(saved, repository);
+    }
+    assert.equal(fs.existsSync(external) ? fs.readFileSync(external, "utf8") : null, exists ? "outside" : null);
+  };
+  try { for (const kind of ["managed", "template"]) for (const exists of [true, false]) confined(kind, exists); }
+  finally { fs.rmSync(temporaryDirectory, { recursive: true, force: true }); }
+});
+
+test("descriptor support fails closed and traversal failures close every descriptor", { skip: process.platform !== "linux" }, () => {
+  const temporaryDirectory = fs.mkdtempSync(path.join(skillRoot, "tests", ".descriptor-support-"));
+  const blocked = (kind, failure) => {
+    const repository = path.join(temporaryDirectory, `${kind}-${failure}`); fs.mkdirSync(repository);
+    const write = preparedWrite(repository, kind); const { openSync, fstatSync } = fs;
+    if (failure === "proc") fs.openSync = function (name, ...args) {
+      if (name === "/proc/self/fd") throw Object.assign(new Error("missing proc"), { code: "ENOENT" });
+      return openSync.call(this, name, ...args);
+    };
+    else {
+      let reads = 0;
+      fs.fstatSync = function (descriptor) {
+        const stat = fstatSync.call(this, descriptor);
+        return ++reads === 2 ? { ...stat, ino: stat.ino + 1 } : stat;
+      };
+    }
+    try { assert.throws(write, /verified \/proc/); }
+    finally { fs.openSync = openSync; fs.fstatSync = fstatSync; }
+    assert.equal(fs.existsSync(path.join(repository, ".github")), false);
+  };
+  try {
+    for (const failure of ["proc", "identity"]) for (const kind of ["managed", "template"]) blocked(kind, failure);
+    const repository = path.join(temporaryDirectory, "cleanup"); fs.mkdirSync(repository);
+    const { openSync, closeSync } = fs; const openDescriptors = new Set();
+    fs.openSync = function (name, ...args) {
+      if (/^\/proc\/self\/fd\/\d+\/.github$/.test(name)) throw Object.assign(new Error("EACCES blocked"), { code: "EACCES" });
+      const descriptor = openSync.call(this, name, ...args);
+      if (name === repository || String(name).startsWith("/proc/self/fd")) openDescriptors.add(descriptor);
+      return descriptor;
+    };
+    fs.closeSync = function (descriptor) { openDescriptors.delete(descriptor); return closeSync.call(this, descriptor); };
+    try { assert.throws(() => writeTemplateFile(repository, ".github/managed.yml", "unsafe"), /EACCES/); assert.deepEqual([...openDescriptors], []); }
+    finally { fs.openSync = openSync; fs.closeSync = closeSync; }
+  } finally { fs.rmSync(temporaryDirectory, { recursive: true, force: true }); }
+});
 
 test("generic files are hashed, safely written, and reject unsafe paths", () => {
   const temporaryDirectory = fs.mkdtempSync(
@@ -1325,6 +1427,44 @@ test("writeManagedFile preserves file permissions (0755, 0600) on replace", () =
         "0755 permissions must be preserved after replace",
       );
     }
+
+    // 0600 permission case
+    fs.writeFileSync(
+      path.join(repository, "governance", "secret.key"),
+      "key-new",
+    );
+    const secretDest = path.join(repository, ".github", "secret.key");
+    fs.writeFileSync(secretDest, "key-old", { mode: 0o600 });
+
+    if (process.platform !== "win32") {
+      const initialSecretMode = fs.statSync(secretDest).mode & 0o777;
+      assert.equal(initialSecretMode, 0o600);
+    }
+
+    const [secretFile] = preflightManagedFiles(
+      {
+        files: {
+          ".github/secret.key": {
+            source: "governance/secret.key",
+            mode: "replace",
+          },
+        },
+      },
+      repository,
+    );
+
+    writeManagedFile(secretFile);
+
+    assert.equal(fs.readFileSync(secretDest, "utf8"), "key-new");
+
+    if (process.platform !== "win32") {
+      const finalSecretMode = fs.statSync(secretDest).mode & 0o777;
+      assert.equal(
+        finalSecretMode,
+        0o600,
+        "0600 permissions must be preserved after replace",
+      );
+    }
   } finally {
     fs.rmSync(temporaryDirectory, { recursive: true, force: true });
   }
@@ -1373,6 +1513,27 @@ test("bootstrap run() does not interpret shell metacharacters in arguments", () 
     const output = run(cmdPath, testArgs);
     const parsed = JSON.parse(output.trim());
     assert.deepEqual(parsed, testArgs);
+  } finally {
+    fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("resolveCommand and run fail closed on unsupported batch script wrappers", () => {
+  const temporaryDirectory = fs.mkdtempSync(
+    path.join(skillRoot, "tests", ".unsupported-batch-"),
+  );
+  try {
+    const unsupportedBat = path.join(temporaryDirectory, "unsupported.bat");
+    fs.writeFileSync(unsupportedBat, "@echo off\r\necho dangerous\r\n");
+
+    assert.throws(
+      () => resolveCommand(unsupportedBat),
+      /crosses a command shell boundary/,
+    );
+    assert.throws(
+      () => run(unsupportedBat, []),
+      /crosses a command shell boundary/,
+    );
   } finally {
     fs.rmSync(temporaryDirectory, { recursive: true, force: true });
   }
