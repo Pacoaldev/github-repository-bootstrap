@@ -50,12 +50,73 @@ function parseArgs(argv) {
   return result;
 }
 
-function run(command, args, options = {}) {
+function unwrapBatchIfPossible(candidate) {
+  if (/\.(cmd|bat)$/i.test(candidate)) {
+    try {
+      const content = fs.readFileSync(candidate, "utf8");
+      const match = /node(?:\.exe)?["\s]+["']?([^"'\r\n]+)["']?/i.exec(content);
+      if (match) {
+        const script = match[1].replace(/%~dp0/g, path.dirname(candidate) + path.sep);
+        const resolvedScript = path.resolve(path.dirname(candidate), script);
+        if (fs.existsSync(resolvedScript)) {
+          return { cmd: process.execPath, args: [resolvedScript] };
+        }
+      }
+    } catch {}
+    return {
+      cmd: process.env.ComSpec || "cmd.exe",
+      args: ["/d", "/c", candidate],
+    };
+  }
+  return { cmd: candidate, args: [] };
+}
+
+export function resolveCommand(command) {
+  if (path.isAbsolute(command) || command.includes("/") || command.includes("\\")) {
+    if (fs.existsSync(command)) {
+      return unwrapBatchIfPossible(command);
+    }
+    for (const ext of [".exe", ".cmd", ".bat"]) {
+      if (fs.existsSync(command + ext)) {
+        return unwrapBatchIfPossible(command + ext);
+      }
+    }
+    return { cmd: command, args: [] };
+  }
+
+  if (process.platform === "win32") {
+    const pathDirs = (process.env.PATH || "").split(path.delimiter);
+    const extensions = (process.env.PATHEXT || ".EXE;.CMD;.BAT;.COM")
+      .split(";")
+      .map((ext) => ext.toLowerCase());
+
+    for (const dir of pathDirs) {
+      if (!dir) continue;
+      for (const ext of ["", ...extensions]) {
+        const candidate = path.join(dir, command + ext);
+        try {
+          if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+            return unwrapBatchIfPossible(candidate);
+          }
+        } catch {
+          // ignore permission errors during PATH scanning
+        }
+      }
+    }
+  }
+
+  return { cmd: command, args: [] };
+}
+
+export function run(command, args, options = {}) {
+  const resolved = resolveCommand(command);
+  const commandArgs = resolved.args ? [...resolved.args, ...args] : args;
   try {
-    return execFileSync(command, args, {
+    return execFileSync(resolved.cmd, commandArgs, {
       encoding: "utf8",
       input: options.input,
       stdio: ["pipe", "pipe", "pipe"],
+      shell: false,
     });
   } catch (error) {
     const detail = String(error.stderr || error.message)
